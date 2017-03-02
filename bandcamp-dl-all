@@ -1,0 +1,188 @@
+#!/usr/bin/python -tt
+
+import urllib
+import urlparse
+import sys
+import os
+import re
+import json
+import tagpy
+
+def usage():
+    print "Usage: %s <url1> [<url2> ... <urlN>]" % sys.argv[0]
+    sys.exit(0);
+
+TRACK_URL_RE = "\/track\/"
+ALBUM_URL_RE = "\/album\/"
+TRACK_HREF_RE = "href=\"(\/track\/[^\"]+)"
+ALBUM_HREF_RE = "href=\"(\/album\/[^\"]+)"
+
+class bandcamp_scraper:
+    def __init__(self):
+        self.baseurls = set() # url strings of basepages processed
+        self.albums = set() # url strings of albums processed
+        self.tracks = set() # url strings of tracks to download
+        self.verbose = False
+        self.redownload = False # do we try to redownload the track if it already exists on disk?
+
+    def tag_mp3_file(self, flocation, **kwargs):
+        self.log_verbose("attempting to tag %s with the following tags:" % flocation)
+        if kwargs:
+            for k,v in kwargs.items():
+                log_verbose("\t%s => %s" % (k,v))
+        else:
+            log_verbose("\tno tags in kwargs - no work to do.")
+            return
+
+    def log_verbose(self, msg):
+        if self.verbose:
+            print msg
+
+    def log_error(self, msg):
+        print msg
+
+    def log(self, msg):
+        print msg
+
+    def download_tracks(self, loc=None):
+        for url in self.tracks:
+            self.log("download track from url %s" % url)
+            r = urllib.urlopen(url)
+            artist = None
+            trackno = None
+            trackname = None
+            albumname = None
+            audio_url = None
+            for ln in r:
+                if 'trackinfo: ' in ln: 
+                    # get rid of trailing comma and leading 'trackinfo'
+                    raw = json.loads(ln.strip()[11:-1])
+                    file_d = raw[0]['file']
+                    track_title = raw[0]['title']
+                    for k in file_d:
+                        audio_url = 'http:' + file_d[k]
+                elif 'artist: ' in ln:
+                    # change 'artist: "foo",' into 'foo'
+                    artist = ln.strip()[9:-2]
+                elif 'album_title : ' in ln:
+                    albumname = ln.strip()[15:-2]
+                elif 'current: ' in ln:
+                    track_search = re.search("track_number\":([0-9]+)", ln)
+                    if track_search:
+                        trackno = track_search.group(1)
+                    trackname_search = re.search("\"title\":\"([^\"]+)", ln)
+                    if trackname_search:
+                        trackname = trackname_search.group(1)
+
+            r.close()
+            if all([artist, trackname, audio_url]):
+                self.download_and_tag(audio_url, artist, trackno, trackname, albumname)
+                self.log("successfully downloaded and tagged track.")
+            else:
+                self.log_error("failed at getting track %s: got artist %s and trackname %s." % (
+                    audio_url, artist, trackname))
+
+    def download_and_tag(self, audio_url, artist, trackno, trackname, albumname):
+        if not trackno:
+            trackno = 1 # for isolated tracks
+        if (not albumname) and trackname:
+            albumname = trackname # ditto
+        def remove_non_ascii(s):
+            return ''.join([i for i in s if ord(i)<128])
+        path = os.path.join(artist, albumname)
+        if not os.path.exists(path):
+            os.makedirs(path)
+        def clean_for_filename(s):
+            return "".join(x for x in s if x.isalnum())
+        output_file = os.path.join(path, "%s-%s-%s-%s.mp3" % (clean_for_filename(artist), clean_for_filename(albumname), trackno, clean_for_filename(trackname)))
+        #self.log_verbose("download track from %s to file %s" % (audio_url, output_file))
+        self.log_verbose("output file: %s" % output_file)
+        if(os.path.exists(output_file) and not self.redownload):
+            self.log_verbose("%s already exists, so we are not downloading it again." % output_file)
+        else: 
+            urllib.urlretrieve(audio_url, output_file)
+            self.log_verbose("tagging %s: artist %s, trackno %s, trackname %s, albumname %s" % (output_file, artist, trackno, trackname, albumname))
+            t = tagpy.FileRef(output_file)
+            tt = t.tag()
+            tt.album = remove_non_ascii(albumname)
+            tt.track = int(trackno)
+            tt.title = remove_non_ascii(trackname)
+            tt.artist = remove_non_ascii(artist)
+            t.save()
+
+
+    # get albums, tracks, etc. from a bandcamp base page url
+    def get_resources_from_basepage(self, url):
+        url = url.rstrip('/')
+        self.log_verbose("getting resources from basepage %s" % url)
+        if url in self.baseurls:
+            self.log_verbose("skipping base url %s as we've already processed it" % url)
+            return
+        self.baseurls.add(url)
+        r = urllib.urlopen(url)
+        for ln in r:
+            asearch = re.search(ALBUM_HREF_RE, ln)
+            tsearch = re.search(TRACK_HREF_RE, ln)
+            if asearch:
+                self.get_track_urls_from_albumpage(url + asearch.group(1))
+            if tsearch:
+                t = url + tsearch.group(1)
+                t = t.replace('com//','com/')
+                if t not in self.tracks:
+                    self.log_verbose("get_resources_from_basepage: adding %s to tracks set" % t)
+                    self.tracks.add(t)
+        r.close()
+
+    def get_track_urls_from_albumpage(self, url):
+        self.log_verbose("getting track urls from albumpage %s" % url)
+        if url not in self.albums:
+            self.albums.add(url)
+            pr = urlparse.urlparse(url)
+            baseurl = url[0:-1 * len(pr.path)]
+            r = urllib.urlopen(url)
+            for ln in r:
+                tsearch = re.search(TRACK_HREF_RE, ln)
+                if tsearch:
+                    t = baseurl + tsearch.group(1)
+                    n = t.rfind('?')
+                    if n > 0:
+                        t = t[:n]
+                    n = t.rfind('#')
+                    if n > 0:
+                        t = t[:n]
+                    if t not in self.tracks:
+                        self.log_verbose("get_track_urls_from_albumpage: adding %s to tracks set" % t)
+                        self.tracks.add(t)
+            r.close()
+        else: 
+            self.log_verbose("skipping album with url %s as we've already processed it" % url)
+
+    def process_url(self, url):
+        self.log("Examining url %s..." % url)
+        if re.search(TRACK_URL_RE, url):
+            self.tracks.add(url)
+        elif re.search(ALBUM_URL_RE, url):
+            self.get_track_urls_from_albumpage(url)
+        else:
+            self.get_resources_from_basepage(url)
+        self.log("Done examining %s. Total tracks is now %s." % (url, len(self.tracks)))
+
+    def print_tracks(self):
+        if self.tracks:
+            self.log("Got the following tracks:")
+            for t in self.tracks:
+                self.log("\t%s" % t)
+        else:
+            self.log("no tracks in set")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        usage()
+
+    bs = bandcamp_scraper()
+    bs.verbose = False
+
+    for url in sys.argv[1:]:
+        bs.process_url(url)
+
+    bs.download_tracks()
